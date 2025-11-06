@@ -246,19 +246,8 @@ actor Renderer {
 
         let metalAllocator = MTKMeshBufferAllocator(device: device)
 
-        // Create a sphere for VR
-        let mdlMesh = MDLMesh.newEllipsoid(withRadii: SIMD3<Float>(1000, 1000, 1000),
-                                          radialSegments: 128,
-                                          verticalSegments: 64,
-                                          geometryType: MDLGeometryType.triangles,
-                                          inwardNormals: true,
-                                          hemisphere: false,
-                                          allocator: metalAllocator)
-//        let mdlMesh = MDLMesh.newBox(withDimensions: SIMD3<Float>(4, 4, 4),
-//                                     segments: SIMD3<UInt32>(2, 2, 2),
-//                                     geometryType: MDLGeometryType.triangles,
-//                                     inwardNormals: false,
-//                                     allocator: metalAllocator)
+        // Create custom hemisphere mesh for VR
+        let mdlMesh = try Self.buildHemisphereMesh(allocator: metalAllocator)
 
         let mdlVertexDescriptor = MTKModelIOVertexDescriptorFromMetal(mtlVertexDescriptor)
 
@@ -271,6 +260,112 @@ actor Renderer {
         mdlMesh.vertexDescriptor = mdlVertexDescriptor
 
         return try MTKMesh(mesh: mdlMesh, device: device)
+    }
+
+    static func buildHemisphereMesh(allocator: MTKMeshBufferAllocator) throws -> MDLMesh {
+        let radius: Float = 1000.0
+        let radialSegments: Int = 128   // Horizontal resolution (azimuth)
+        let verticalSegments: Int = 64   // Vertical resolution (elevation)
+
+        // Generate vertices for front hemisphere only (-π/2 to π/2 azimuth)
+        var vertices: [SIMD3<Float>] = []
+        var texcoords: [SIMD2<Float>] = []
+
+        // Generate hemisphere vertices
+        for y in 0...verticalSegments {
+            // Elevation: -π/2 (bottom) to π/2 (top)
+            let elevation = Float.pi * (Float(y) / Float(verticalSegments) - 0.5)
+
+            for x in 0...radialSegments {
+                // Azimuth: -π/2 (left) to π/2 (right) - front hemisphere only
+                let azimuth = Float.pi * (Float(x) / Float(radialSegments) - 0.5)
+
+                // Convert spherical to Cartesian coordinates
+                let cosElev = cos(elevation)
+                let sinElev = sin(elevation)
+                let cosAzim = cos(azimuth)
+                let sinAzim = sin(azimuth)
+
+                // Position: hemisphere facing forward (+Z direction), but flip Z for interior viewing
+                let pos = SIMD3<Float>(
+                    radius * cosElev * sinAzim,  // X (left-right)
+                    radius * sinElev,            // Y (up-down)
+                    -radius * cosElev * cosAzim  // -Z (facing viewer)
+                )
+                vertices.append(pos)
+
+                // UV coordinates for VR180 content
+                // Map azimuth (-π/2 to π/2) to U (0 to 0.5)
+                let u = Float(x) / Float(radialSegments) * 0.5
+                // Map elevation (-π/2 to π/2) to V (0 to 1)
+                let v = Float(y) / Float(verticalSegments)
+
+                texcoords.append(SIMD2<Float>(u, v))
+            }
+        }
+
+        // Generate triangle indices
+        var indices: [UInt32] = []
+        for y in 0..<verticalSegments {
+            for x in 0..<radialSegments {
+                let current = y * (radialSegments + 1) + x
+                let next = current + 1
+                let bottom = (y + 1) * (radialSegments + 1) + x
+                let bottomNext = bottom + 1
+
+                // First triangle
+                indices.append(UInt32(current))
+                indices.append(UInt32(bottom))
+                indices.append(UInt32(next))
+
+                // Second triangle
+                indices.append(UInt32(next))
+                indices.append(UInt32(bottom))
+                indices.append(UInt32(bottomNext))
+            }
+        }
+
+        // Create mesh data using MTKMeshBufferAllocator
+        let vertexBuffer = allocator.newBuffer(from: nil, length: MemoryLayout<SIMD3<Float>>.size * vertices.count, type: .vertex)!
+        let texcoordBuffer = allocator.newBuffer(from: nil, length: MemoryLayout<SIMD2<Float>>.size * texcoords.count, type: .vertex)!
+        let indexBuffer = allocator.newBuffer(from: nil, length: MemoryLayout<UInt32>.size * indices.count, type: .index)!
+
+        // Copy data to buffers
+        let vertexMap = vertexBuffer.map()
+        memcpy(vertexMap.bytes, vertices, MemoryLayout<SIMD3<Float>>.size * vertices.count)
+
+        let texcoordMap = texcoordBuffer.map()
+        memcpy(texcoordMap.bytes, texcoords, MemoryLayout<SIMD2<Float>>.size * texcoords.count)
+
+        let indexMap = indexBuffer.map()
+        memcpy(indexMap.bytes, indices, MemoryLayout<UInt32>.size * indices.count)
+
+        let vertexSource = vertexBuffer
+        let texcoordSource = texcoordBuffer
+        let indexSource = indexBuffer
+
+        // Create vertex descriptor
+        let vertexDescriptor = MDLVertexDescriptor()
+
+        // Position attribute (buffer index 0)
+        let positionAttribute = MDLVertexAttribute(name: MDLVertexAttributePosition, format: .float3, offset: 0, bufferIndex: 0)
+        let positionLayout = MDLVertexBufferLayout(stride: MemoryLayout<SIMD3<Float>>.stride)
+        vertexDescriptor.attributes = [positionAttribute]
+        vertexDescriptor.layouts = [positionLayout]
+
+        // Texture coordinate attribute (buffer index 1)
+        let texcoordAttribute = MDLVertexAttribute(name: MDLVertexAttributeTextureCoordinate, format: .float2, offset: 0, bufferIndex: 1)
+        let texcoordLayout = MDLVertexBufferLayout(stride: MemoryLayout<SIMD2<Float>>.stride)
+        vertexDescriptor.attributes.add(texcoordAttribute)
+        vertexDescriptor.layouts.add(texcoordLayout)
+
+        // Create submesh
+        let submesh = MDLSubmesh(indexBuffer: indexSource, indexCount: indices.count, indexType: .uint32, geometryType: .triangles, material: nil)
+
+        // Create mesh
+        let mesh = MDLMesh(vertexBuffers: [vertexSource, texcoordSource], vertexCount: vertices.count, descriptor: vertexDescriptor, submeshes: [submesh])
+
+        return mesh
     }
 
     static func loadTexture(device: MTLDevice,
